@@ -1,16 +1,18 @@
-// SSH hosts: a Termius-style list of saved ssh connections. Opened as a dialog
-// (`mod.open ssh-hosts`). Click a host to ssh into it in a new tab.
+// SSH Hosts: a Termius-style host manager that lives in its own tab.
+// Left: groups. Middle: search + NEW HOST + a grid of host cards.
+// Right: the host form while adding or editing.
+// Single click selects a card, double click (or the play button) opens ssh in a new tab.
 // Hosts live in <appHome>/data/ssh-hosts.json.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { run, props, closeOverlay, theme, appHome, home, readTextFile, writeTextFile, notify } from "herdr";
+import { run, theme, appHome, home, readTextFile, writeTextFile, notify } from "herdr";
 
 const ICON = (n) => `mods/ssh-hosts/${n}.svg`;
 const FIELDS = [
   ["label", "Label", "prod-api"],
-  ["host", "Host or IP", "203.0.113.10"],
-  ["user", "User", "root"],
+  ["host", "Address", "203.0.113.10"],
+  ["user", "Username", "root"],
   ["port", "Port", "22"],
   ["group", "Group", "Production"],
   ["identity", "Identity file (optional)", "~/.ssh/id_ed25519"],
@@ -48,6 +50,7 @@ function sshArgv(h) {
 }
 
 const target = (h) => (h.alias && !h.host ? h.alias : `${h.user ? h.user + "@" : ""}${h.host}${h.port && h.port !== "22" ? ":" + h.port : ""}`);
+const subtitle = (h) => ["ssh", h.user || (h.alias ? h.alias : "")].filter(Boolean).join(", ");
 
 export default class SshHosts extends View {
   init(_props, cx) {
@@ -55,23 +58,23 @@ export default class SshHosts extends View {
     this.raw = null; // file text as last read, for writeTextFile's check
     this.loaded = false;
     this.query = "";
-    this.mode = "list"; // "list" | "form"
-    this.editing = null; // index being edited, or null for new
+    this.group = null; // null = all hosts
+    this.selected = null; // index into this.hosts
+    this.form = false;
+    this.editing = null; // index being edited, or null for a new host
     this.values = {};
     this.focusedField = null;
     this.error = "";
     this.handle = cx.focus_handle();
 
-    this.search = InputState.new({ placeholder: "Search hosts" });
+    this.search = InputState.new({ placeholder: "Find a host" });
     this.search.on("change", (_e, cx) => { this.query = this.search.value(); cx.notify(); });
     this.search.on("focus", (_e, cx) => { this.focusedField = "search"; cx.notify(); });
     this.search.on("blur", (_e, cx) => { if (this.focusedField === "search") this.focusedField = null; cx.notify(); });
-    this.search.on("submit", (_e, cx) => {
+    this.search.on("submit", () => {
       const first = this.filtered()[0];
       if (first) this.connect(first.h, "tab");
     });
-    this.search.focus();
-    cx.timer.after(600, () => { if (this.mode === "list") this.search.focus(); });
 
     this.inputs = {};
     for (const [key, , ph] of FIELDS) {
@@ -104,24 +107,30 @@ export default class SshHosts extends View {
     }
   }
 
+  groups() {
+    const m = new Map();
+    for (const h of this.hosts) m.set(h.group || "Ungrouped", (m.get(h.group || "Ungrouped") ?? 0) + 1);
+    return [...m.entries()];
+  }
+
   filtered() {
     const q = this.query.trim().toLowerCase();
     return this.hosts
       .map((h, i) => ({ h, i }))
+      .filter(({ h }) => this.group === null || (h.group || "Ungrouped") === this.group)
       .filter(({ h }) => !q || [h.label, h.host, h.user, h.group, h.alias].some((v) => (v ?? "").toLowerCase().includes(q)));
   }
 
   connect(h, place) {
-    closeOverlay(props().overlay);
     if (place === "split") run("pane.split", { direction: "right", argv: sshArgv(h) });
     else run("tab.new", { name: h.label || target(h), argv: sshArgv(h) });
   }
 
   edit(index) {
-    this.mode = "form";
+    this.form = true;
     this.editing = index;
     this.error = "";
-    const h = index === null ? {} : this.hosts[index];
+    const h = index === null ? { group: this.group ?? "" } : this.hosts[index];
     for (const [key] of FIELDS) {
       this.values[key] = h[key] ?? "";
       this.inputs[key].set_value(h[key] ?? "");
@@ -132,22 +141,23 @@ export default class SshHosts extends View {
   save(cx) {
     const v = this.values;
     const alias = this.editing !== null ? this.hosts[this.editing].alias : undefined;
-    if (!v.host?.trim() && !alias) { this.error = "Host or IP is required."; cx.notify(); return; }
+    if (!v.host?.trim() && !alias) { this.error = "Address is required."; cx.notify(); return; }
     if (v.port && !/^\d{1,5}$/.test(v.port.trim())) { this.error = "Port must be a number."; cx.notify(); return; }
     const entry = {};
     for (const [key] of FIELDS) entry[key] = (v[key] ?? "").trim();
     if (alias) entry.alias = alias;
     if (!entry.label) entry.label = entry.host || alias;
-    if (this.editing === null) this.hosts.push(entry);
+    if (this.editing === null) { this.hosts.push(entry); this.selected = this.hosts.length - 1; }
     else this.hosts[this.editing] = entry;
-    this.mode = "list";
+    this.form = false;
     cx.spawn(async (cx) => { await this.persist(); cx.notify(); });
-    this.search.focus();
     cx.notify();
   }
 
   remove(index, cx) {
     this.hosts.splice(index, 1);
+    this.selected = null;
+    if (this.group !== null && !this.groups().some(([g]) => g === this.group)) this.group = null;
     cx.spawn(async (cx) => { await this.persist(); cx.notify(); });
     cx.notify();
   }
@@ -165,92 +175,112 @@ export default class SshHosts extends View {
   }
 
   key(e, cx) {
-    if (e.key === "escape") {
-      if (this.mode === "form") { this.mode = "list"; this.search.focus(); }
-      else closeOverlay(props().overlay);
-      cx.stop_propagation();
-      cx.notify();
-    }
+    if (e.key === "escape" && this.form) { this.form = false; this.error = ""; cx.stop_propagation(); cx.notify(); }
   }
 
   button(t, id, text, primary, action, icon) {
-    return h_flex().id(id).h(32).px(14).gap(6).items_center().rounded(8)
-      .border_1().border_color(primary ? t.solid : t.input).bg(primary ? t.solid : t.raised)
-      .text_color(primary ? t.solid_foreground : t.foreground).text_size(12.5).font_medium().cursor_pointer()
+    return h_flex().id(id).h(32).px(14).gap(6).items_center().flex_none().rounded(8)
+      .border_1().border_color(primary ? t.accent : t.input).bg(primary ? t.accent : t.raised)
+      .text_color(primary ? t.accent_foreground : t.foreground).text_size(12.5).font_semibold().cursor_pointer()
       .hover((s) => s.opacity(0.88)).on_click(action)
       .when(Boolean(icon), (el) => el.child(svg(ICON(icon)).size(13)))
       .child(text);
   }
 
   iconButton(t, id, icon, action, danger) {
-    return div().id(id).w(26).h(26).rounded(6).flex().items_center().justify_center().cursor_pointer()
+    return div().id(id).w(26).h(26).rounded(6).flex().items_center().justify_center().flex_none().cursor_pointer()
       .text_color(danger ? t.blocked : t.muted).hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => { cx.stop_propagation(); action(cx); })
       .child(svg(ICON(icon)).size(14));
   }
 
-  row(t, { h, i }) {
-    return h_flex().id(`h-${i}`).h(46).px(10).gap(10).items_center().flex_none().rounded(8).cursor_pointer()
-      .hover((s) => s.bg(t.hover))
-      .on_click(() => this.connect(h, "tab"))
-      .child(div().w(30).h(30).rounded(7).flex().items_center().justify_center().bg(t.raised).text_color(t.accent).child(svg(ICON("server")).size(15)))
-      .child(v_flex().flex_1().min_w(0)
-        .child(div().text_size(13).font_medium().text_color(t.foreground).truncate().child(h.label))
-        .child(div().text_size(11.5).text_color(t.dim).truncate().child(target(h))))
-      .child(this.iconButton(t, `split-${i}`, "plus", () => this.connect(h, "split")))
-      .child(this.iconButton(t, `edit-${i}`, "pencil", () => { this.edit(i); }))
-      .child(this.iconButton(t, `del-${i}`, "trash", (cx) => this.remove(i, cx), true));
+  navItem(t, id, label, count, active, action) {
+    return h_flex().id(id).h(30).px(10).gap(8).items_center().flex_none().rounded(7).cursor_pointer()
+      .bg(active ? t.selected : t.chrome).text_color(active ? t.foreground : t.muted).text_size(12.5)
+      .hover((s) => s.bg(t.hover)).on_click(action)
+      .child(div().flex_1().min_w(0).truncate().child(label))
+      .child(div().text_size(11).text_color(t.dim).child(String(count)));
   }
 
-  list(t) {
+  sidebar(t) {
+    return v_flex().w(210).flex_none().h_full().p(12).gap(2).bg(t.chrome).border_r(1).border_color(t.border)
+      .child(h_flex().items_center().gap(8).px(4).pb(12)
+        .child(div().w(26).h(26).rounded(7).flex().items_center().justify_center().bg(t.accent).text_color(t.accent_foreground).child(svg(ICON("server")).size(14)))
+        .child(div().text_size(14).font_semibold().child("SSH Hosts")))
+      .child(div().px(10).pt(4).pb(6).text_size(11).font_medium().text_color(t.dim).child("VAULT"))
+      .child(this.navItem(t, "nav-all", "All hosts", this.hosts.length, this.group === null, (_e, cx) => { this.group = null; cx.notify(); }))
+      .child(div().px(10).pt(14).pb(6).text_size(11).font_medium().text_color(t.dim).child("GROUPS"))
+      .children(this.groups().map(([g, n]) => this.navItem(t, `nav-${g}`, g, n, this.group === g, (_e, cx) => { this.group = g; cx.notify(); })))
+      .child(div().flex_1())
+      .child(this.button(t, "ssh-import", "Import ~/.ssh/config", false, (_e, cx) => this.importConfig(cx)));
+  }
+
+  card(t, { h, i }) {
+    const sel = this.selected === i;
+    return h_flex().id(`card-${i}`).w(268).h(66).px(12).gap(12).items_center().flex_none().rounded(10).cursor_pointer()
+      .border_1().border_color(sel ? t.accent : t.border).bg(sel ? t.raised : t.surface)
+      .hover((s) => s.bg(t.raised))
+      .on_mouse_down("left", (e, cx) => {
+        if (e.click_count === 2) this.connect(h, "tab");
+        else { this.selected = i; cx.notify(); }
+      })
+      .child(div().w(40).h(40).rounded(9).flex().items_center().justify_center().flex_none().bg(t.accent + "26").text_color(t.accent).child(svg(ICON("server")).size(20)))
+      .child(v_flex().flex_1().min_w(0).gap(1)
+        .child(div().text_size(13.5).font_semibold().text_color(t.foreground).truncate().child(h.label))
+        .child(div().text_size(11.5).text_color(t.dim).truncate().child(sel ? target(h) : subtitle(h))))
+      .when(sel, (el) => el
+        .child(this.iconButton(t, `go-${i}`, "terminal", () => this.connect(h, "tab")))
+        .child(this.iconButton(t, `split-${i}`, "split", () => this.connect(h, "split")))
+        .child(this.iconButton(t, `edit-${i}`, "pencil", () => this.edit(i)))
+        .child(this.iconButton(t, `del-${i}`, "trash", (cx) => this.remove(i, cx), true)));
+  }
+
+  main(t) {
     const rows = this.filtered();
-    const groups = new Map();
-    for (const r of rows) {
-      const g = r.h.group || "Ungrouped";
-      if (!groups.has(g)) groups.set(g, []);
-      groups.get(g).push(r);
-    }
-    const body = [];
-    for (const [name, items] of groups) {
-      body.push(div().px(10).pt(10).pb(4).flex_none().text_size(11).font_medium().text_color(t.dim).child(`${name.toUpperCase()} · ${items.length}`));
-      for (const r of items) body.push(this.row(t, r));
-    }
-    return v_flex().min_h(0).flex_1()
-      .child(Input.new(this.search).h(34).px(10).rounded(8).border_1()
-        .border_color(this.focusedField === "search" ? t.accent : t.input).bg(t.background).text_size(13).text_color(t.foreground))
-      .child(v_flex().id("hosts-scroll").flex_1().min_h(0).h(300).mt(6).overflow_y_scroll().children(
-        !this.loaded ? [div().p(10).text_size(12.5).text_color(t.dim).child("Loading…")]
-          : rows.length ? body
-          : [v_flex().p(24).items_center().gap(8)
-              .child(div().text_size(13).text_color(t.muted).child(this.hosts.length ? "No host matches." : "No saved hosts yet."))
-              .child(div().text_size(12).text_color(t.dim).child("Add one, or import the hosts from ~/.ssh/config.")) ]))
-      .when(Boolean(this.error), (el) => el.child(div().pt(6).text_size(12).text_color(t.blocked).child(this.error)))
-      .child(h_flex().pt(14).gap(8)
-        .child(this.button(t, "ssh-new", "New host", true, () => this.edit(null), "plus"))
-        .child(this.button(t, "ssh-import", "Import ~/.ssh/config", false, (_e, cx) => this.importConfig(cx)))
+    const grid = rows.length
+      ? h_flex().flex_wrap().gap(12).content_start().children(rows.map((r) => this.card(t, r)))
+      : v_flex().pt(80).items_center().gap(8)
+          .child(div().w(56).h(56).rounded(14).flex().items_center().justify_center().bg(t.raised).text_color(t.dim).child(svg(ICON("server")).size(26)))
+          .child(div().text_size(14).font_medium().child(this.hosts.length ? "No host matches" : "Add your first host"))
+          .child(div().text_size(12).text_color(t.dim).child(this.hosts.length ? "Try another search or group." : "Press NEW HOST, or import your ~/.ssh/config."));
+    return v_flex().flex_1().min_w(0).h_full()
+      .child(h_flex().h(60).px(20).gap(12).items_center().flex_none().border_b(1).border_color(t.border)
+        .child(div().flex_1().max_w(520).child(
+          Input.new(this.search).h(34).px(12).rounded(8).border_1()
+            .border_color(this.focusedField === "search" ? t.accent : t.input).bg(t.background).text_size(13).text_color(t.foreground)))
         .child(div().flex_1())
-        .child(div().text_size(11).text_color(t.dim).self_center().child("Enter connects the first match")));
+        .child(this.button(t, "ssh-new", "NEW HOST", true, () => this.edit(null), "plus")))
+      .child(v_flex().id("hosts-scroll").flex_1().min_h(0).px(20).py(16).gap(12).overflow_y_scroll()
+        .child(h_flex().items_baseline().gap(8)
+          .child(div().text_size(18).font_semibold().child(this.group ?? "Hosts"))
+          .child(div().text_size(12).text_color(t.dim).child(`${rows.length} host${rows.length === 1 ? "" : "s"}`)))
+        .child(!this.loaded ? div().text_size(12.5).text_color(t.dim).child("Loading…") : grid)
+        .when(Boolean(this.error) && !this.form, (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.error))));
   }
 
-  form(t) {
-    return v_flex().gap(2)
-      .children(FIELDS.map(([key, label]) => v_flex().child(div().pt(10).pb(5).text_size(11.5).text_color(t.dim).child(label))
-        .child(Input.new(this.inputs[key]).h(34).px(10).rounded(8).border_1()
-          .border_color(this.focusedField === key ? t.accent : t.input).bg(t.background).text_size(13).text_color(t.foreground))))
+  formPanel(t) {
+    return v_flex().w(320).flex_none().h_full().p(18).bg(t.chrome).border_l(1).border_color(t.border)
+      .child(h_flex().items_center().pb(6)
+        .child(div().flex_1().text_size(15).font_semibold().child(this.editing === null ? "New host" : "Edit host"))
+        .child(this.iconButton(t, "form-close", "x", (cx) => { this.form = false; this.error = ""; cx.notify(); })))
+      .child(v_flex().id("form-scroll").flex_1().min_h(0).overflow_y_scroll()
+        .children(FIELDS.map(([key, label]) => v_flex()
+          .child(div().pt(10).pb(5).text_size(11.5).text_color(t.dim).child(label))
+          .child(Input.new(this.inputs[key]).h(34).px(10).rounded(8).border_1()
+            .border_color(this.focusedField === key ? t.accent : t.input).bg(t.background).text_size(13).text_color(t.foreground)))))
       .when(Boolean(this.error), (el) => el.child(div().pt(8).text_size(12).text_color(t.blocked).child(this.error)))
       .child(h_flex().pt(16).gap(8).justify_end()
-        .child(this.button(t, "ssh-cancel", "Cancel", false, (_e, cx) => { this.mode = "list"; this.error = ""; this.search.focus(); cx.notify(); }))
+        .child(this.button(t, "ssh-cancel", "Cancel", false, (_e, cx) => { this.form = false; this.error = ""; cx.notify(); }))
         .child(this.button(t, "ssh-save", "Save", true, (_e, cx) => this.save(cx))));
   }
 
   render() {
     const t = theme();
-    return v_flex().id("ssh-hosts").track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
-      .w_full().min_h(0).p(18).bg(t.popover).text_color(t.foreground)
-      .child(h_flex().items_center().pb(12)
-        .child(div().flex_1().text_size(15).font_semibold().child(this.mode === "form" ? (this.editing === null ? "New host" : "Edit host") : "SSH hosts"))
-        .child(div().text_size(11).text_color(t.dim).child("Esc")))
-      .child(this.mode === "form" ? this.form(t) : this.list(t));
+    return h_flex().id("ssh-hosts").track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
+      .size_full().min_h(0).bg(t.background).text_color(t.foreground)
+      .child(this.sidebar(t))
+      .child(this.main(t))
+      .when(this.form, (el) => el.child(this.formPanel(t)));
   }
 }
