@@ -1,4 +1,4 @@
-﻿# SSH Hosts
+# SSH Hosts
 
 A Termius-style SSH manager that opens as its own tab in Herdr. A host list on the left by group, a search bar and a blue NEW HOST button on top, and a grid of host cards. Double-click a card and `ssh` runs in a new tab. A small "SSH" button sits in the tab bar next to Files and Changes and opens the tab.
 
@@ -13,7 +13,7 @@ One full tab (the tab's only pane is the mod), three columns, on the theme `back
   - "VAULT" caption (11px, `dim`), then an "All hosts" row with the total count.
   - "GROUPS" caption, then one row per group with its host count. Hosts without a group sit under "Ungrouped".
   - Rows are 30px high, 7px radius, 12.5px text; the active one has the `selected` background and `foreground` text.
-  - At the bottom, an outlined "Import ~/.ssh/config" button (32px).
+  - At the bottom, two outlined 32px buttons: "Import / Export" (swap icon) and "Import ~/.ssh/config".
 - **Top bar, 60px**, 1px `border` below: a search input (34px, max 520px wide, `input` border, `accent` while focused, placeholder "Find a host") and, at the right, a solid `accent` "NEW HOST" button with a plus icon (32px, semibold, 12.5px).
 - **Content**, scrolls vertically, 20px side padding: a heading (18px, semibold; the group name or "Hosts") with a small "N hosts" count (12px, `dim`), then a wrapping grid, 12px gap, of cards:
   - Card: 268 x 66px, 10px radius, 1px `border`, `surface` background, 12px padding.
@@ -22,6 +22,7 @@ One full tab (the tab's only pane is the mod), three columns, on the theme `back
   - Selected card: `accent` border, `raised` background, the subtitle becomes `user@host:port`, and four 26px icon buttons appear on the right: terminal (connect), split, pencil (edit), trash (delete, `blocked` color).
   - Empty states: no hosts at all shows a 56px tile, "Add your first host" and "Press NEW HOST, or import your ~/.ssh/config."; a search or group with no match shows "No host matches".
 - **Right form panel, 320px**, `chrome` background, 1px `border` on its left, only while adding or editing: title "New host" / "Edit host" with an x button; inputs Label, Address, Username, Port, Group, "Identity file (optional)" (each 34px, 13px text); an error line in `blocked`; Cancel (outlined) and Save (solid `accent`) buttons.
+- **Import / Export panel, 340px**, same panel style as the form, replaces it: title "Import / Export" with an x; a short explanation; a "File path" input (12.5px) prefilled with `~/Downloads/liteterm-hosts.json`; a solid "Import" and an outlined "Export" button; a result line below (`working` color on success, `blocked` on error); and at the bottom a dim note that passwords in a LiteTerm file are kept as plain text and are not used to connect.
 - **Tab bar button** (outside the mod): "SSH" with the server icon, same 26px pill style as Files and Changes, right after Changes. It has the `selected` background while the SSH tab is the active tab.
 
 ## How it behaves
@@ -30,20 +31,37 @@ One full tab (the tab's only pane is the mod), three columns, on the theme `back
 - Search filters by label, address, user, group and alias, together with the selected group.
 - NEW HOST opens the form with the current group prefilled. Pencil fills it with the host. Save needs an address (imported alias hosts are exempt) and a numeric port; otherwise the message "Address is required." or "Port must be a number." shows. Enter in any field saves. Esc or the x closes the form.
 - Trash removes the host at once and saves (no confirmation, no undo). If its group becomes empty, the view goes back to All hosts.
+- "Import / Export" opens its panel (closing the form). Import reads the file at the path (quotes and a leading `~` are fine; Enter in the path box also imports) and merges it: hosts with the same label, address, user and port are skipped. The result reads "Imported N hosts, M already here." Dropping a `.json` file on the tab opens the panel and imports it at once. A non-LiteTerm or invalid file shows "That isn't a LiteTerm hosts file." / "That file isn't valid JSON.", a missing one "No file at that path.".
+- Export writes every saved host to the path. If a file is already there the first press only says "That file exists. Press Export again to replace it."; changing the path resets that. With no hosts it says so and writes nothing.
+- Esc closes the form or the panel.
 - "Import ~/.ssh/config" adds every named, non-wildcard `Host` not already saved, in the group "ssh config", and posts a toast "Imported N from ~/.ssh/config" or "Nothing new in ~/.ssh/config". Imported hosts connect with `ssh <alias>`, so ssh applies its own config.
 - The SSH tab-bar button selects the existing tab named "SSH" in the current space, or creates it.
 - Agent statuses (working, blocked, done, idle) have no effect on this mod.
 
 ## Built from
 
-Files: `mods/ssh-hosts/main.js`, `mod.json` (`{ "place": "none" }`), and icons `server.svg`, `terminal.svg`, `split.svg`, `pencil.svg`, `trash.svg`, `plus.svg`, `x.svg` (24px viewBox, `stroke="currentColor"`, stroke-width 2, round caps and joins, Lucide-style). Draw them with `svg("mods/ssh-hosts/<name>.svg")`. No `keys.json` is needed.
+Files: `mods/ssh-hosts/main.js`, `liteterm.js` (pure import/export functions, imported as `./liteterm.js`), `mod.json` (`{ "place": "none" }`), and icons `server.svg`, `terminal.svg`, `split.svg`, `pencil.svg`, `trash.svg`, `plus.svg`, `x.svg`, `swap.svg` (24px viewBox, `stroke="currentColor"`, stroke-width 2, round caps and joins, Lucide-style). Draw them with `svg("mods/ssh-hosts/<name>.svg")`. No `keys.json` is needed.
 
 - `main.js` default-exports a `View` and imports `div`, `svg` from `gpui-kit`; `v_flex`, `h_flex`, `InputState`, `Input` from `gpui-base`; `run`, `theme`, `appHome`, `home`, `readTextFile`, `writeTextFile`, `notify` from `herdr`. Export nothing else from the file.
 - Root: `h_flex().size_full()` with sidebar, main column, and the form panel (only when open). Cards use `flex_wrap().gap(12)`. Double-click is detected in `on_mouse_down("left", e => e.click_count === 2)`.
 - One `InputState` for search and one per form field, each with `change`, `focus`, `blur` and `submit` handlers.
 - Storage: `<appHome>/data/ssh-hosts.json` as `{ "hosts": [ { label, host, user, port, group, identity, alias? } ] }`. Read in `init` with `readTextFile`. Written with `writeTextFile(path, text, previousText)`, keeping the last text read or written so the stale check passes. A failed write shows "Couldn't save: ..." under the grid.
 - ssh argv: alias host is `["ssh", alias]`. Otherwise `["ssh", "-p", port (only if not 22), "-i", identity (leading `~` replaced by `home()`, only if set), "user@host"]`, with no `user@` when user is empty.
+### The LiteTerm file format
+
+```json
+{ "app": "liteterm", "version": 1, "exportedAt": 1793681545917,
+  "groups": [ { "name": "AWS" } ],
+  "hosts": [ { "address": "43.218.119.113", "authMethod": "key", "group": "AWS", "keyPath": "C:\\Users\\me\\.ssh/keys/a.pem",
+               "label": "bersamabot", "port": 22, "username": "ubuntu" } ] }
+```
+
+`authMethod` is `"password"` or `"key"`; `password`, `keyPath` and `os` appear only when set. Mapping to a saved host: `address`=host, `username`=user, `port` (number)=port (string), `group`=group, `label`=label, `keyPath`=identity; `authMethod`, `password` and `os` are kept on the host untouched (the form never shows or drops them, and editing a host preserves them). A host without a `address` is ignored; a file whose `app` isn't `liteterm` or without a `hosts` array is refused.
+
+Export (`toLiteTerm`) maps back: `authMethod` is the kept value, else `"key"` when there is an identity, else `"password"`; an empty group becomes `"Ungrouped"`; the port is a number (22 when blank); hosts are sorted by label and `groups` is the sorted list of group names in use; keys inside each host are alphabetical; `version` is 1 and `exportedAt` is the current time in ms. Importing a LiteTerm file and exporting it again gives the same hosts and groups.
+
 - Commands: `tab.new { name, argv }`, `pane.split { direction: "right", argv }`.
+- Import/Export read and write the path the person types through `readTextFile` / `writeTextFile(path, text, expected)` (pass the current file text as `expected` when replacing a file, `null` for a new one). `on_drop` on the root takes `event.paths`.
 - Programs: only `ssh`, started through those commands. It reads `~/.ssh/config` and writes only its data file. It makes no network calls of its own.
 
 ### The tab-bar button
@@ -67,7 +85,8 @@ Without the button the tab still works: `herdr-app do tab.new --name SSH --mod s
 ## Watch out
 
 - `tab.new` takes `mod`, not `name` of a mod, and `--name` is the tab title. `mod.open:ssh-hosts` opens it as a dialog, which is not the intended form.
-- Passwords are never stored. Use ssh keys, or type the password in the terminal that opens.
+- Passwords typed in the app are never stored, and stored ones are never used to connect: ssh asks in the terminal that opens. A password that came from a LiteTerm file stays in `data/ssh-hosts.json` and in exports as plain text, so treat both files as secrets and never commit them.
+- Save text files as UTF-8 without a BOM, and keep `main.js` ASCII (a "…" rewritten by a Windows-1252 editor turned into mojibake once).
 - No drag to reorder, no moving between groups except editing the Group field. No folders inside groups, no SFTP, no port forwarding, no tags (unlike Termius).
 - Connections are plain local ssh terminals, not Herdr machines (`hc machine add`).
 - Assumes `ssh` is on PATH (OpenSSH ships with current Windows).
@@ -83,3 +102,5 @@ Without the button the tab still works: `herdr-app do tab.new --name SSH --mod s
 - Search narrows the cards, and Enter opens the first match.
 - Pencil edits and trash deletes; both persist after closing and reopening the tab.
 - Import adds the named hosts of `~/.ssh/config` once; running it again says nothing new.
+- Importing a LiteTerm file adds its hosts under their groups (counts in the sidebar match the file); importing it twice adds nothing the second time.
+- Exporting to a new path writes a LiteTerm file that, when parsed, has the same hosts and groups as the file that was imported; exporting to an existing path asks for a second press.

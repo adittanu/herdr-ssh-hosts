@@ -1,4 +1,4 @@
-﻿// SSH Hosts: a Termius-style host manager that lives in its own tab.
+// SSH Hosts: a Termius-style host manager that lives in its own tab.
 // Left: groups. Middle: search + NEW HOST + a grid of host cards.
 // Right: the host form while adding or editing.
 // Single click selects a card, double click (or the play button) opens ssh in a new tab.
@@ -7,6 +7,7 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { run, theme, appHome, home, readTextFile, writeTextFile, notify } from "herdr";
+import { fromLiteTerm, mergeHosts, toLiteTerm } from "./liteterm.js";
 
 const ICON = (n) => `mods/ssh-hosts/${n}.svg`;
 const FIELDS = [
@@ -61,8 +62,18 @@ export default class SshHosts extends View {
     this.group = null; // null = all hosts
     this.selected = null; // index into this.hosts
     this.form = false;
+    this.transfer = false; // the Import / Export panel
+    this.busy = false;
+    this.note = ""; // result line in the transfer panel
+    this.noteError = false;
+    this.overwrite = null; // path the next Export may replace
     this.editing = null; // index being edited, or null for a new host
     this.values = {};
+    this.pathInput = InputState.new({ placeholder: "C:\\Users\\you\\Downloads\\liteterm-hosts.json", value: `${home()}/Downloads/liteterm-hosts.json` });
+    this.pathInput.on("change", (_e, cx) => { this.overwrite = null; cx.notify(); });
+    this.pathInput.on("focus", (_e, cx) => { this.focusedField = "path"; cx.notify(); });
+    this.pathInput.on("blur", (_e, cx) => { if (this.focusedField === "path") this.focusedField = null; cx.notify(); });
+    this.pathInput.on("submit", (_e, cx) => this.importFile(this.pathInput.value(), cx));
     this.focusedField = null;
     this.error = "";
     this.handle = cx.focus_handle();
@@ -126,7 +137,70 @@ export default class SshHosts extends View {
     else run("tab.new", { name: h.label || target(h), argv: sshArgv(h) });
   }
 
+  openTransfer(cx) {
+    this.form = false;
+    this.transfer = true;
+    this.note = "";
+    this.overwrite = null;
+    cx.notify();
+  }
+
+  // Paths people type: "~" is home, and quotes pasted from Explorer are dropped.
+  cleanPath(p) {
+    return (p ?? "").trim().replace(/^"(.*)"$/, "$1").replace(/^~(?=[\\/]|$)/, home());
+  }
+
+  say(text, isError = false) { this.note = text; this.noteError = isError; }
+
+  importFile(path, cx) {
+    path = this.cleanPath(path);
+    if (!path || this.busy) return;
+    this.busy = true;
+    this.overwrite = null;
+    cx.spawn(async (cx) => {
+      try {
+        const text = await readTextFile(path);
+        if (text === null) throw new Error("No file at that path.");
+        const { added, skipped } = mergeHosts(this.hosts, fromLiteTerm(text));
+        this.hosts.push(...added);
+        if (added.length) await this.persist();
+        this.say(`Imported ${added.length} host${added.length === 1 ? "" : "s"}${skipped ? `, ${skipped} already here` : ""}.${this.error ? " " + this.error : ""}`, Boolean(this.error));
+      } catch (e) {
+        this.say(String(e.message ?? e), true);
+      }
+      this.busy = false;
+      cx.notify();
+    });
+    cx.notify();
+  }
+
+  exportFile(path, cx) {
+    path = this.cleanPath(path);
+    if (!path || this.busy) return;
+    if (!this.hosts.length) { this.say("There are no hosts to export.", true); cx.notify(); return; }
+    this.busy = true;
+    cx.spawn(async (cx) => {
+      try {
+        const existing = await readTextFile(path).catch(() => null);
+        if (existing !== null && this.overwrite !== path) {
+          this.overwrite = path;
+          this.say("That file exists. Press Export again to replace it.", true);
+        } else {
+          await writeTextFile(path, toLiteTerm(this.hosts), existing);
+          this.overwrite = null;
+          this.say(`Exported ${this.hosts.length} hosts to ${path}`);
+        }
+      } catch (e) {
+        this.say(`Couldn't write the file: ${e.message ?? e}`, true);
+      }
+      this.busy = false;
+      cx.notify();
+    });
+    cx.notify();
+  }
+
   edit(index, cx) {
+    this.transfer = false;
     this.form = true;
     this.editing = index;
     this.error = "";
@@ -144,7 +218,8 @@ export default class SshHosts extends View {
     const alias = this.editing !== null ? this.hosts[this.editing].alias : undefined;
     if (!v.host?.trim() && !alias) { this.error = "Address is required."; cx.notify(); return; }
     if (v.port && !/^\d{1,5}$/.test(v.port.trim())) { this.error = "Port must be a number."; cx.notify(); return; }
-    const entry = {};
+    // Keep what the form doesn't show (an imported password, authMethod, os).
+    const entry = this.editing !== null ? { ...this.hosts[this.editing] } : {};
     for (const [key] of FIELDS) entry[key] = (v[key] ?? "").trim();
     if (alias) entry.alias = alias;
     if (!entry.label) entry.label = entry.host || alias;
@@ -176,7 +251,7 @@ export default class SshHosts extends View {
   }
 
   key(e, cx) {
-    if (e.key === "escape" && this.form) { this.form = false; this.error = ""; cx.stop_propagation(); cx.notify(); }
+    if (e.key === "escape" && (this.form || this.transfer)) { this.form = false; this.transfer = false; this.error = ""; cx.stop_propagation(); cx.notify(); }
   }
 
   button(t, id, text, primary, action, icon) {
@@ -214,7 +289,9 @@ export default class SshHosts extends View {
       .child(div().px(10).pt(14).pb(6).text_size(11).font_medium().text_color(t.dim).child("GROUPS"))
       .children(this.groups().map(([g, n]) => this.navItem(t, `nav-${g}`, g, n, this.group === g, (_e, cx) => { this.group = g; cx.notify(); })))
       .child(div().flex_1())
-      .child(this.button(t, "ssh-import", "Import ~/.ssh/config", false, (_e, cx) => this.importConfig(cx)));
+      .child(v_flex().gap(8)
+        .child(this.button(t, "ssh-transfer", "Import / Export", false, (_e, cx) => this.openTransfer(cx), "swap"))
+        .child(this.button(t, "ssh-import", "Import ~/.ssh/config", false, (_e, cx) => this.importConfig(cx))));
   }
 
   card(t, { h, i }) {
@@ -256,7 +333,7 @@ export default class SshHosts extends View {
         .child(h_flex().items_baseline().gap(8)
           .child(div().text_size(18).font_semibold().child(this.group ?? "Hosts"))
           .child(div().text_size(12).text_color(t.dim).child(`${rows.length} host${rows.length === 1 ? "" : "s"}`)))
-        .child(!this.loaded ? div().text_size(12.5).text_color(t.dim).child("Loadingâ€¦") : grid)
+        .child(!this.loaded ? div().text_size(12.5).text_color(t.dim).child("Loading...") : grid)
         .when(Boolean(this.error) && !this.form, (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.error))));
   }
 
@@ -276,12 +353,38 @@ export default class SshHosts extends View {
         .child(this.button(t, "ssh-save", "Save", true, (_e, cx) => this.save(cx))));
   }
 
+  transferPanel(t) {
+    const close = (cx) => { this.transfer = false; cx.notify(); };
+    return v_flex().w(340).flex_none().h_full().p(18).bg(t.chrome).border_l(1).border_color(t.border)
+      .child(h_flex().items_center().pb(6)
+        .child(div().flex_1().text_size(15).font_semibold().child("Import / Export"))
+        .child(this.iconButton(t, "transfer-close", "x", close)))
+      .child(div().pt(4).text_size(12).line_height("17px").text_color(t.muted).child("A LiteTerm hosts file (.json). You can also drop one onto this tab to import it."))
+      .child(div().pt(14).pb(5).text_size(11.5).text_color(t.dim).child("File path"))
+      .child(Input.new(this.pathInput).h(34).px(10).rounded(8).border_1()
+        .border_color(this.focusedField === "path" ? t.accent : t.input).bg(t.background).text_size(12.5).text_color(t.foreground))
+      .child(h_flex().pt(14).gap(8)
+        .child(this.button(t, "ssh-do-import", "Import", true, (_e, cx) => this.importFile(this.pathInput.value(), cx), "plus"))
+        .child(this.button(t, "ssh-do-export", "Export", false, (_e, cx) => this.exportFile(this.pathInput.value(), cx))))
+      .when(Boolean(this.note), (el) => el.child(div().pt(14).text_size(12).line_height("17px").text_color(this.noteError ? t.blocked : t.working).child(this.note)))
+      .child(div().flex_1())
+      .child(div().text_size(11.5).line_height("16px").text_color(t.dim).child("Import skips hosts already saved (same name, address, user and port). Passwords in a LiteTerm file are kept and exported back as plain text; they are not used to connect."));
+  }
+
   render() {
     const t = theme();
     return h_flex().id("ssh-hosts").track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
+      .on_drop((e, cx) => {
+        const p = (e.paths ?? []).find((x) => /\.json$/i.test(x));
+        if (!p) return;
+        this.transfer = true; this.form = false;
+        this.pathInput.set_value(p);
+        this.importFile(p, cx);
+      })
       .size_full().min_h(0).bg(t.background).text_color(t.foreground)
       .child(this.sidebar(t))
       .child(this.main(t))
-      .when(this.form, (el) => el.child(this.formPanel(t)));
+      .when(this.form, (el) => el.child(this.formPanel(t)))
+      .when(this.transfer, (el) => el.child(this.transferPanel(t)));
   }
 }
