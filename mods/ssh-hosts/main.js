@@ -1,4 +1,4 @@
-// SSH Hosts: a Termius-style host manager that lives in its own tab.
+﻿// SSH Hosts: a Termius-style host manager that lives in its own tab.
 // Left: groups. Middle: search + NEW HOST + a grid of host cards.
 // Right: the host form while adding or editing.
 // Single click selects a card, double click (or the play button) opens ssh in a new tab.
@@ -126,7 +126,7 @@ export default class SshHosts extends View {
     else run("tab.new", { name: h.label || target(h), argv: sshArgv(h) });
   }
 
-  edit(index) {
+  edit(index, cx) {
     this.form = true;
     this.editing = index;
     this.error = "";
@@ -135,7 +135,8 @@ export default class SshHosts extends View {
       this.values[key] = h[key] ?? "";
       this.inputs[key].set_value(h[key] ?? "");
     }
-    this.inputs.label.focus();
+    cx.notify();
+    cx.timer.after(80, () => this.inputs.label.focus());
   }
 
   save(cx) {
@@ -232,7 +233,7 @@ export default class SshHosts extends View {
       .when(sel, (el) => el
         .child(this.iconButton(t, `go-${i}`, "terminal", () => this.connect(h, "tab")))
         .child(this.iconButton(t, `split-${i}`, "split", () => this.connect(h, "split")))
-        .child(this.iconButton(t, `edit-${i}`, "pencil", () => this.edit(i)))
+        .child(this.iconButton(t, `edit-${i}`, "pencil", (cx) => this.edit(i, cx)))
         .child(this.iconButton(t, `del-${i}`, "trash", (cx) => this.remove(i, cx), true)));
   }
 
@@ -250,12 +251,12 @@ export default class SshHosts extends View {
           Input.new(this.search).h(34).px(12).rounded(8).border_1()
             .border_color(this.focusedField === "search" ? t.accent : t.input).bg(t.background).text_size(13).text_color(t.foreground)))
         .child(div().flex_1())
-        .child(this.button(t, "ssh-new", "NEW HOST", true, () => this.edit(null), "plus")))
+        .child(this.button(t, "ssh-new", "NEW HOST", true, (_e, cx) => this.edit(null, cx), "plus")))
       .child(v_flex().id("hosts-scroll").flex_1().min_h(0).px(20).py(16).gap(12).overflow_y_scroll()
         .child(h_flex().items_baseline().gap(8)
           .child(div().text_size(18).font_semibold().child(this.group ?? "Hosts"))
           .child(div().text_size(12).text_color(t.dim).child(`${rows.length} host${rows.length === 1 ? "" : "s"}`)))
-        .child(!this.loaded ? div().text_size(12.5).text_color(t.dim).child("Loading…") : grid)
+        .child(!this.loaded ? div().text_size(12.5).text_color(t.dim).child("Loadingâ€¦") : grid)
         .when(Boolean(this.error) && !this.form, (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.error))));
   }
 
