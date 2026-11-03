@@ -6,7 +6,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { run, hc, terminals, focused, theme, appHome, home, readTextFile, writeTextFile, notify } from "herdr";
+import { run, hc, terminals, focused, shared, setShared, theme, appHome, home, readTextFile, writeTextFile, notify } from "herdr";
 import { fromLiteTerm, mergeHosts, toLiteTerm } from "./liteterm.js";
 
 const ICON = (n) => `mods/ssh-hosts/${n}.svg`;
@@ -94,7 +94,7 @@ export default class SshHosts extends View {
     this.inputs = {};
     for (const [key, , ph] of FIELDS) {
       const s = InputState.new({ placeholder: ph });
-      if (key === "password") s.set_masked(true);
+      if (key === "password" || (this.privacy() && ["label", "host", "user"].includes(key))) s.set_masked(true);
       s.on("change", (_e, cx) => { this.values[key] = s.value(); cx.notify(); });
       s.on("focus", (_e, cx) => { this.focusedField = key; cx.notify(); });
       s.on("blur", (_e, cx) => { if (this.focusedField === key) this.focusedField = null; cx.notify(); });
@@ -140,7 +140,7 @@ export default class SshHosts extends View {
   connect(h, place, cx) {
     if (h.password) return this.autoLogin(h, place);
     if (place === "split") run("pane.split", { direction: "right", argv: sshArgv(h) });
-    else run("tab.new", { name: h.label || target(h), argv: sshArgv(h) });
+    else run("tab.new", { name: this.privacy() ? "ssh session" : h.label || target(h), argv: sshArgv(h) });
   }
 
   // A host with a saved password: open ssh as usual, find the terminal it started
@@ -150,7 +150,7 @@ export default class SshHosts extends View {
     const known = new Set(terminals().map((t) => t.address));
     const before = focused()?.terminal ?? null;
     if (place === "split") run("pane.split", { direction: "right", argv: sshArgv(h) });
-    else run("tab.new", { name: h.label || target(h), argv: sshArgv(h) });
+    else run("tab.new", { name: this.privacy() ? "ssh session" : h.label || target(h), argv: sshArgv(h) });
     this.pending.push({ known, before, address: null, password: h.password, started: Date.now(), busy: false, sent: false });
   }
 
@@ -239,6 +239,21 @@ export default class SshHosts extends View {
     if (e.key === "escape" && (this.form || this.transfer)) { this.form = false; this.transfer = false; this.error = ""; cx.stop_propagation(); cx.notify(); }
   }
 
+  // Privacy mode: shared across copies and kept between runs.
+  privacy() { return shared("ssh-hosts.privacy") === true; }
+
+  setPrivacy(on) {
+    setShared("ssh-hosts.privacy", on);
+    for (const key of ["label", "host", "user"]) this.inputs[key].set_masked(on);
+  }
+
+  // There is no native blur, so hidden text is replaced by a soft bar the same width.
+  // The real text is never drawn, so a screenshot cannot recover it.
+  redact(t, text, size, height) {
+    const w = Math.min(190, Math.max(40, String(text ?? "").length * size * 0.62));
+    return div().h(height).flex().items_center().child(div().w(w).h(size * 0.78).rounded(size * 0.4).bg(t.muted + "38"));
+  }
+
   button(t, id, text, primary, action, icon) {
     return h_flex().id(id).h(32).px(14).gap(6).items_center().flex_none().rounded(8)
       .border_1().border_color(primary ? t.accent : t.input).bg(primary ? t.accent : t.raised)
@@ -281,6 +296,7 @@ export default class SshHosts extends View {
 
   card(t, { h, i }) {
     const sel = this.selected === i;
+    const hide = this.privacy();
     return h_flex().id(`card-${i}`).w(268).h(66).px(12).gap(12).items_center().flex_none().rounded(10).cursor_pointer()
       .border_1().border_color(sel ? t.accent : t.border).bg(sel ? t.raised : t.surface)
       .hover((s) => s.bg(t.raised))
@@ -290,8 +306,8 @@ export default class SshHosts extends View {
       })
       .child(div().w(40).h(40).rounded(9).flex().items_center().justify_center().flex_none().bg(t.accent + "26").text_color(t.accent).child(svg(ICON("server")).size(20)))
       .child(v_flex().flex_1().min_w(0).gap(1)
-        .child(div().text_size(13.5).font_semibold().text_color(t.foreground).truncate().child(h.label))
-        .child(div().text_size(11.5).text_color(t.dim).truncate().child(sel ? target(h) : subtitle(h))))
+        .child(hide ? this.redact(t, h.label, 13.5, 17) : div().text_size(13.5).font_semibold().text_color(t.foreground).truncate().child(h.label))
+        .child(hide ? this.redact(t, sel ? target(h) : subtitle(h), 11.5, 15) : div().text_size(11.5).text_color(t.dim).truncate().child(sel ? target(h) : subtitle(h))))
       .when(sel, (el) => el
         .child(this.iconButton(t, `go-${i}`, "terminal", (cx) => this.connect(h, "tab", cx)))
         .child(this.iconButton(t, `split-${i}`, "split", (cx) => this.connect(h, "split", cx)))
@@ -313,6 +329,11 @@ export default class SshHosts extends View {
           Input.new(this.search).h(34).px(12).rounded(8).border_1()
             .border_color(this.focusedField === "search" ? t.accent : t.input).bg(t.background).text_size(13).text_color(t.foreground)))
         .child(div().flex_1())
+        .child(div().id("ssh-privacy").w(34).h(34).rounded(8).flex().items_center().justify_center().flex_none().cursor_pointer()
+          .border_1().border_color(this.privacy() ? t.accent : t.input).bg(this.privacy() ? t.accent + "26" : t.raised)
+          .text_color(this.privacy() ? t.accent : t.muted).hover((s) => s.opacity(0.88))
+          .on_click((_e, cx) => { this.setPrivacy(!this.privacy()); cx.notify(); })
+          .child(svg(ICON(this.privacy() ? "eye-off" : "eye")).size(16)))
         .child(this.button(t, "ssh-new", "NEW HOST", true, (_e, cx) => this.edit(null, cx), "plus")))
       .child(v_flex().id("hosts-scroll").flex_1().min_h(0).px(20).py(16).gap(12).overflow_y_scroll()
         .child(h_flex().items_baseline().gap(8)

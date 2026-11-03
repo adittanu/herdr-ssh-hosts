@@ -14,7 +14,7 @@ One full tab (the tab's only pane is the mod), three columns, on the theme `back
   - "GROUPS" caption, then one row per group with its host count. Hosts without a group sit under "Ungrouped".
   - Rows are 30px high, 7px radius, 12.5px text; the active one has the `selected` background and `foreground` text.
   - At the bottom, two outlined 32px buttons: "Import / Export" (swap icon) and "Import ~/.ssh/config".
-- **Top bar, 60px**, 1px `border` below: a search input (34px, max 520px wide, `input` border, `accent` while focused, placeholder "Find a host") and, at the right, a solid `accent` "NEW HOST" button with a plus icon (32px, semibold, 12.5px).
+- **Top bar, 60px**, 1px `border` below: a search input (34px, max 520px wide, `input` border, `accent` while focused, placeholder "Find a host") and, at the right, a 34px square eye button (eye icon, `raised` background, `input` border) and a solid `accent` "NEW HOST" button with a plus icon (32px, semibold, 12.5px).
 - **Content**, scrolls vertically, 20px side padding: a heading (18px, semibold; the group name or "Hosts") with a small "N hosts" count (12px, `dim`), then a wrapping grid, 12px gap, of cards:
   - Card: 268 x 66px, 10px radius, 1px `border`, `surface` background, 12px padding.
   - A 40px rounded tile tinted `accent` at 15% (`accent + "26"`) holding a 20px server icon in `accent`.
@@ -30,6 +30,7 @@ One full tab (the tab's only pane is the mod), three columns, on the theme `back
 - Single click selects a card. Double-click, the terminal button, or Enter in the search box (first match) opens a new tab named after the host and running the ssh command. The split button runs `pane.split` right with the same command in the current tab.
 - Search filters by label, address, user, group and alias, together with the selected group.
 - NEW HOST opens the form with the current group prefilled. Pencil fills it with the host. Save needs an address (imported alias hosts are exempt) and a numeric port; otherwise the message "Address is required." or "Port must be a number." shows. Enter in any field saves. Esc or the x closes the form.
+- **Privacy mode (eye button):** toggles hiding. While on, the button shows the eye-off icon with an `accent` border and a 15% `accent` fill, and every card shows grey bars (`muted` at 22%, rounded, 190px at most, about 0.62 x font size per character) instead of the label and the subtitle, so a screenshot cannot recover the text. The selected card's action buttons stay. The Label, Address and Username inputs in the form are masked, new connections open in a tab named "ssh session" instead of the host's name, and the choice is kept in shared state `ssh-hosts.privacy` so it survives restarts.
 - **Auto-login:** a host with a saved password connects like any other (new tab named after the host, or the split), and when ssh shows a password prompt the saved password is typed and Enter pressed, once. The first host-key question ("yes/no") is left to the person, and a wrong password is not retried. Leaving the password empty in the form removes it. Imported passwords work the same way.
 - Trash removes the host at once and saves (no confirmation, no undo). If its group becomes empty, the view goes back to All hosts.
 - "Import / Export" opens its panel (closing the form). Import reads the file at the path (quotes and a leading `~` are fine; Enter in the path box also imports) and merges it: hosts with the same label, address, user and port are skipped. The result reads "Imported N hosts, M already here." Dropping a `.json` file on the tab opens the panel and imports it at once. A non-LiteTerm or invalid file shows "That isn't a LiteTerm hosts file." / "That file isn't valid JSON.", a missing one "No file at that path.".
@@ -41,7 +42,7 @@ One full tab (the tab's only pane is the mod), three columns, on the theme `back
 
 ## Built from
 
-Files: `mods/ssh-hosts/main.js`, `liteterm.js` (pure import/export functions, imported as `./liteterm.js`), `mod.json` (`{ "place": "none" }`), and icons `server.svg`, `terminal.svg`, `split.svg`, `pencil.svg`, `trash.svg`, `plus.svg`, `x.svg`, `swap.svg` (24px viewBox, `stroke="currentColor"`, stroke-width 2, round caps and joins, Lucide-style). Draw them with `svg("mods/ssh-hosts/<name>.svg")`. No `keys.json` is needed.
+Files: `mods/ssh-hosts/main.js`, `liteterm.js` (pure import/export functions, imported as `./liteterm.js`), `mod.json` (`{ "place": "none" }`), and icons `server.svg`, `terminal.svg`, `split.svg`, `pencil.svg`, `trash.svg`, `plus.svg`, `x.svg`, `swap.svg`, `eye.svg`, `eye-off.svg` (24px viewBox, `stroke="currentColor"`, stroke-width 2, round caps and joins, Lucide-style). Draw them with `svg("mods/ssh-hosts/<name>.svg")`. No `keys.json` is needed.
 
 - `main.js` default-exports a `View` and imports `div`, `svg` from `gpui-kit`; `v_flex`, `h_flex`, `InputState`, `Input` from `gpui-base`; `run`, `theme`, `appHome`, `home`, `readTextFile`, `writeTextFile`, `notify` from `herdr`. Export nothing else from the file.
 - Root: `h_flex().size_full()` with sidebar, main column, and the form panel (only when open). Cards use `flex_wrap().gap(12)`. Double-click is detected in `on_mouse_down("left", e => e.click_count === 2)`.
@@ -91,6 +92,7 @@ Without the button the tab still works: `herdr-app do tab.new --name SSH --mod s
 - `hc run` + `terminal.keep` does not work for this: a terminal started that way has no tab to be kept in. Starting with `tab.new` and finding the terminal by focus is what works.
 - Auto-login only types into a prompt that ends with `password...:`. A key passphrase prompt, a 2FA code or a changed host key still needs the person.
 - Save text files as UTF-8 without a BOM, and keep `main.js` ASCII (a "…" rewritten by a Windows-1252 editor turned into mojibake once).
+- There is no native blur in gpui-kit, so privacy mode draws placeholder bars. Group names in the sidebar, the heading and the terminal itself (the ssh prompt shows `user@host`) are not hidden, and tabs opened before the mode was turned on keep their names.
 - No drag to reorder, no moving between groups except editing the Group field. No folders inside groups, no SFTP, no port forwarding, no tags (unlike Termius).
 - Connections are plain local ssh terminals, not Herdr machines (`hc machine add`).
 - Assumes `ssh` is on PATH (OpenSSH ships with current Windows).
@@ -103,6 +105,7 @@ Without the button the tab still works: `herdr-app do tab.new --name SSH --mod s
 - The SSH button appears after Changes in the tab bar, and clicking it opens or focuses a tab named SSH showing the three-column view.
 - NEW HOST, then Save, adds a card under its group and the sidebar counts update; `data/ssh-hosts.json` contains it.
 - Double-clicking the card opens a new tab named after the host that runs `ssh user@host` (with `-p` for a port other than 22).
+- The eye button replaces every card's label and subtitle with bars and back, the Label/Address/Username inputs show dots while it is on, and the setting is still on after the app restarts.
 - Search narrows the cards, and Enter opens the first match.
 - Pencil edits and trash deletes; both persist after closing and reopening the tab.
 - Import adds the named hosts of `~/.ssh/config` once; running it again says nothing new.
