@@ -18,10 +18,10 @@ One full tab (the tab's only pane is the mod), three columns, on the theme `back
 - **Content**, scrolls vertically, 20px side padding: a heading (18px, semibold; the group name or "Hosts") with a small "N hosts" count (12px, `dim`), then a wrapping grid, 12px gap, of cards:
   - Card: 268 x 66px, 10px radius, 1px `border`, `surface` background, 12px padding.
   - A 40px rounded tile tinted `accent` at 15% (`accent + "26"`) holding a 20px server icon in `accent`.
-  - The label (13.5px, semibold) over `ssh, <user>` (11.5px, `dim`). An imported ssh-config host shows `ssh, <alias>`.
+  - The label (13.5px, semibold) over `ssh, <user>` (11.5px, `dim`), with `, auto-login` added when a password is saved. An imported ssh-config host shows `ssh, <alias>`.
   - Selected card: `accent` border, `raised` background, the subtitle becomes `user@host:port`, and four 26px icon buttons appear on the right: terminal (connect), split, pencil (edit), trash (delete, `blocked` color).
   - Empty states: no hosts at all shows a 56px tile, "Add your first host" and "Press NEW HOST, or import your ~/.ssh/config."; a search or group with no match shows "No host matches".
-- **Right form panel, 320px**, `chrome` background, 1px `border` on its left, only while adding or editing: title "New host" / "Edit host" with an x button; inputs Label, Address, Username, Port, Group, "Identity file (optional)" (each 34px, 13px text); an error line in `blocked`; Cancel (outlined) and Save (solid `accent`) buttons.
+- **Right form panel, 320px**, `chrome` background, 1px `border` on its left, only while adding or editing: title "New host" / "Edit host" with an x button; inputs Label, Address, Username, "Password (optional, saved as plain text)" (masked), Port, Group, "Identity file (optional)" (each 34px, 13px text); an error line in `blocked`; Cancel (outlined) and Save (solid `accent`) buttons.
 - **Import / Export panel, 340px**, same panel style as the form, replaces it: title "Import / Export" with an x; a short explanation; a "File path" input (12.5px) prefilled with `~/Downloads/liteterm-hosts.json`; a solid "Import" and an outlined "Export" button; a result line below (`working` color on success, `blocked` on error); and at the bottom a dim note that passwords in a LiteTerm file are kept as plain text and are not used to connect.
 - **Tab bar button** (outside the mod): "SSH" with the server icon, same 26px pill style as Files and Changes, right after Changes. It has the `selected` background while the SSH tab is the active tab.
 
@@ -30,6 +30,7 @@ One full tab (the tab's only pane is the mod), three columns, on the theme `back
 - Single click selects a card. Double-click, the terminal button, or Enter in the search box (first match) opens a new tab named after the host and running the ssh command. The split button runs `pane.split` right with the same command in the current tab.
 - Search filters by label, address, user, group and alias, together with the selected group.
 - NEW HOST opens the form with the current group prefilled. Pencil fills it with the host. Save needs an address (imported alias hosts are exempt) and a numeric port; otherwise the message "Address is required." or "Port must be a number." shows. Enter in any field saves. Esc or the x closes the form.
+- **Auto-login:** a host with a saved password connects like any other (new tab named after the host, or the split), and when ssh shows a password prompt the saved password is typed and Enter pressed, once. The first host-key question ("yes/no") is left to the person, and a wrong password is not retried. Leaving the password empty in the form removes it. Imported passwords work the same way.
 - Trash removes the host at once and saves (no confirmation, no undo). If its group becomes empty, the view goes back to All hosts.
 - "Import / Export" opens its panel (closing the form). Import reads the file at the path (quotes and a leading `~` are fine; Enter in the path box also imports) and merges it: hosts with the same label, address, user and port are skipped. The result reads "Imported N hosts, M already here." Dropping a `.json` file on the tab opens the panel and imports it at once. A non-LiteTerm or invalid file shows "That isn't a LiteTerm hosts file." / "That file isn't valid JSON.", a missing one "No file at that path.".
 - Export writes every saved host to the path. If a file is already there the first press only says "That file exists. Press Export again to replace it."; changing the path resets that. With no hosts it says so and writes nothing.
@@ -62,6 +63,7 @@ Export (`toLiteTerm`) maps back: `authMethod` is the kept value, else `"key"` wh
 
 - Commands: `tab.new { name, argv }`, `pane.split { direction: "right", argv }`.
 - Import/Export read and write the path the person types through `readTextFile` / `writeTextFile(path, text, expected)` (pass the current file text as `expected` when replacing a file, `null` for a new one). `on_drop` on the root takes `event.paths`.
+- Auto-login (`autoLogin` + a 500 ms `cx.timer.every` calling `tick`): before starting, remember `terminals()` addresses and the focused terminal; start ssh with `tab.new` / `pane.split`; then `tick` waits for `focused().terminal` to be an address that did not exist before (the new, focused terminal) and, every 500 ms for at most 120 s, runs `hc read <t>` and checks that the last non-empty line matches `/password[^\n]*:\s*$/i` and not `passphrase`. On a match it runs `hc send --force -- <t> <password>` (the `--` keeps a password starting with `-` from being read as an option) and stops. The password input is `InputState` with `set_masked(true)`.
 - Programs: only `ssh`, started through those commands. It reads `~/.ssh/config` and writes only its data file. It makes no network calls of its own.
 
 ### The tab-bar button
@@ -85,7 +87,9 @@ Without the button the tab still works: `herdr-app do tab.new --name SSH --mod s
 ## Watch out
 
 - `tab.new` takes `mod`, not `name` of a mod, and `--name` is the tab title. `mod.open:ssh-hosts` opens it as a dialog, which is not the intended form.
-- Passwords typed in the app are never stored, and stored ones are never used to connect: ssh asks in the terminal that opens. A password that came from a LiteTerm file stays in `data/ssh-hosts.json` and in exports as plain text, so treat both files as secrets and never commit them.
+- Saved passwords live in `data/ssh-hosts.json` and in exports as plain text, and each login passes the password to `hc send` as a command-line argument for an instant, so other programs on the machine could see it. Treat both files as secrets and never commit them. Prefer ssh keys where you can.
+- `hc run` + `terminal.keep` does not work for this: a terminal started that way has no tab to be kept in. Starting with `tab.new` and finding the terminal by focus is what works.
+- Auto-login only types into a prompt that ends with `password...:`. A key passphrase prompt, a 2FA code or a changed host key still needs the person.
 - Save text files as UTF-8 without a BOM, and keep `main.js` ASCII (a "…" rewritten by a Windows-1252 editor turned into mojibake once).
 - No drag to reorder, no moving between groups except editing the Group field. No folders inside groups, no SFTP, no port forwarding, no tags (unlike Termius).
 - Connections are plain local ssh terminals, not Herdr machines (`hc machine add`).
@@ -102,5 +106,6 @@ Without the button the tab still works: `herdr-app do tab.new --name SSH --mod s
 - Search narrows the cards, and Enter opens the first match.
 - Pencil edits and trash deletes; both persist after closing and reopening the tab.
 - Import adds the named hosts of `~/.ssh/config` once; running it again says nothing new.
+- With a fake program that asks `Read-Host -AsSecureString "x password"` instead of ssh, connecting a host whose password is `-Pa$$ w@@3 x` opens a tab and the program receives exactly that string.
 - Importing a LiteTerm file adds its hosts under their groups (counts in the sidebar match the file); importing it twice adds nothing the second time.
 - Exporting to a new path writes a LiteTerm file that, when parsed, has the same hosts and groups as the file that was imported; exporting to an existing path asks for a second press.

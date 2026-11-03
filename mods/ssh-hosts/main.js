@@ -6,7 +6,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { run, theme, appHome, home, readTextFile, writeTextFile, notify } from "herdr";
+import { run, hc, terminals, focused, theme, appHome, home, readTextFile, writeTextFile, notify } from "herdr";
 import { fromLiteTerm, mergeHosts, toLiteTerm } from "./liteterm.js";
 
 const ICON = (n) => `mods/ssh-hosts/${n}.svg`;
@@ -14,6 +14,7 @@ const FIELDS = [
   ["label", "Label", "prod-api"],
   ["host", "Address", "203.0.113.10"],
   ["user", "Username", "root"],
+  ["password", "Password (optional, saved as plain text)", ""],
   ["port", "Port", "22"],
   ["group", "Group", "Production"],
   ["identity", "Identity file (optional)", "~/.ssh/id_ed25519"],
@@ -51,7 +52,7 @@ function sshArgv(h) {
 }
 
 const target = (h) => (h.alias && !h.host ? h.alias : `${h.user ? h.user + "@" : ""}${h.host}${h.port && h.port !== "22" ? ":" + h.port : ""}`);
-const subtitle = (h) => ["ssh", h.user || (h.alias ? h.alias : "")].filter(Boolean).join(", ");
+const subtitle = (h) => ["ssh", h.user || (h.alias ? h.alias : ""), h.password ? "auto-login" : ""].filter(Boolean).join(", ");
 
 export default class SshHosts extends View {
   init(_props, cx) {
@@ -82,14 +83,18 @@ export default class SshHosts extends View {
     this.search.on("change", (_e, cx) => { this.query = this.search.value(); cx.notify(); });
     this.search.on("focus", (_e, cx) => { this.focusedField = "search"; cx.notify(); });
     this.search.on("blur", (_e, cx) => { if (this.focusedField === "search") this.focusedField = null; cx.notify(); });
-    this.search.on("submit", () => {
+    this.search.on("submit", (_e, cx) => {
       const first = this.filtered()[0];
-      if (first) this.connect(first.h, "tab");
+      if (first) this.connect(first.h, "tab", cx);
     });
+
+    this.pending = []; // ssh terminals waiting for their password prompt
+    cx.timer.every(500, (cx) => this.tick(cx));
 
     this.inputs = {};
     for (const [key, , ph] of FIELDS) {
       const s = InputState.new({ placeholder: ph });
+      if (key === "password") s.set_masked(true);
       s.on("change", (_e, cx) => { this.values[key] = s.value(); cx.notify(); });
       s.on("focus", (_e, cx) => { this.focusedField = key; cx.notify(); });
       s.on("blur", (_e, cx) => { if (this.focusedField === key) this.focusedField = null; cx.notify(); });
@@ -132,73 +137,52 @@ export default class SshHosts extends View {
       .filter(({ h }) => !q || [h.label, h.host, h.user, h.group, h.alias].some((v) => (v ?? "").toLowerCase().includes(q)));
   }
 
-  connect(h, place) {
+  connect(h, place, cx) {
+    if (h.password) return this.autoLogin(h, place);
     if (place === "split") run("pane.split", { direction: "right", argv: sshArgv(h) });
     else run("tab.new", { name: h.label || target(h), argv: sshArgv(h) });
   }
 
-  openTransfer(cx) {
-    this.form = false;
-    this.transfer = true;
-    this.note = "";
-    this.overwrite = null;
-    cx.notify();
+  // A host with a saved password: open ssh as usual, find the terminal it started
+  // (the new, focused one), and type the password once when ssh asks for it.
+  // The first host-key question ("yes/no") is left to the person.
+  autoLogin(h, place, cx) {
+    const known = new Set(terminals().map((t) => t.address));
+    const before = focused()?.terminal ?? null;
+    if (place === "split") run("pane.split", { direction: "right", argv: sshArgv(h) });
+    else run("tab.new", { name: h.label || target(h), argv: sshArgv(h) });
+    this.pending.push({ known, before, address: null, password: h.password, started: Date.now(), busy: false, sent: false });
   }
 
-  // Paths people type: "~" is home, and quotes pasted from Explorer are dropped.
-  cleanPath(p) {
-    return (p ?? "").trim().replace(/^"(.*)"$/, "$1").replace(/^~(?=[\\/]|$)/, home());
-  }
-
-  say(text, isError = false) { this.note = text; this.noteError = isError; }
-
-  importFile(path, cx) {
-    path = this.cleanPath(path);
-    if (!path || this.busy) return;
-    this.busy = true;
-    this.overwrite = null;
-    cx.spawn(async (cx) => {
-      try {
-        const text = await readTextFile(path);
-        if (text === null) throw new Error("No file at that path.");
-        const { added, skipped } = mergeHosts(this.hosts, fromLiteTerm(text));
-        this.hosts.push(...added);
-        if (added.length) await this.persist();
-        this.say(`Imported ${added.length} host${added.length === 1 ? "" : "s"}${skipped ? `, ${skipped} already here` : ""}.${this.error ? " " + this.error : ""}`, Boolean(this.error));
-      } catch (e) {
-        this.say(String(e.message ?? e), true);
+  tick(cx) {
+    if (!this.pending.length) return;
+    for (const p of this.pending) {
+      if (p.busy) continue;
+      if (Date.now() - p.started > 120000) { p.dead = true; continue; }
+      if (!p.address) {
+        const f = focused()?.terminal;
+        if (f && f !== p.before && !p.known.has(f)) p.address = f;
+        else continue;
       }
-      this.busy = false;
-      cx.notify();
-    });
-    cx.notify();
+      p.busy = true;
+      cx.spawn(async (cx) => {
+        try {
+          const r = await hc(["read", p.address]);
+          if (r.code !== 0) p.dead = true;
+          else {
+            const lines = r.stdout.split("\n").map((l) => l.trimEnd()).filter(Boolean);
+            const last = lines[lines.length - 1] ?? "";
+            if (/password[^\n]*:\s*$/i.test(last) && !/passphrase/i.test(last)) {
+              await hc(["send", "--force", "--", p.address, p.password]);
+              p.dead = true; // once only: a wrong password is retyped by hand
+            }
+          }
+        } catch { p.dead = true; }
+        p.busy = false;
+      });
+    }
+    this.pending = this.pending.filter((p) => !p.dead);
   }
-
-  exportFile(path, cx) {
-    path = this.cleanPath(path);
-    if (!path || this.busy) return;
-    if (!this.hosts.length) { this.say("There are no hosts to export.", true); cx.notify(); return; }
-    this.busy = true;
-    cx.spawn(async (cx) => {
-      try {
-        const existing = await readTextFile(path).catch(() => null);
-        if (existing !== null && this.overwrite !== path) {
-          this.overwrite = path;
-          this.say("That file exists. Press Export again to replace it.", true);
-        } else {
-          await writeTextFile(path, toLiteTerm(this.hosts), existing);
-          this.overwrite = null;
-          this.say(`Exported ${this.hosts.length} hosts to ${path}`);
-        }
-      } catch (e) {
-        this.say(`Couldn't write the file: ${e.message ?? e}`, true);
-      }
-      this.busy = false;
-      cx.notify();
-    });
-    cx.notify();
-  }
-
   edit(index, cx) {
     this.transfer = false;
     this.form = true;
@@ -220,7 +204,8 @@ export default class SshHosts extends View {
     if (v.port && !/^\d{1,5}$/.test(v.port.trim())) { this.error = "Port must be a number."; cx.notify(); return; }
     // Keep what the form doesn't show (an imported password, authMethod, os).
     const entry = this.editing !== null ? { ...this.hosts[this.editing] } : {};
-    for (const [key] of FIELDS) entry[key] = (v[key] ?? "").trim();
+    for (const [key] of FIELDS) entry[key] = key === "password" ? (v[key] ?? "") : (v[key] ?? "").trim();
+    if (!entry.password) delete entry.password;
     if (alias) entry.alias = alias;
     if (!entry.label) entry.label = entry.host || alias;
     if (this.editing === null) { this.hosts.push(entry); this.selected = this.hosts.length - 1; }
@@ -300,7 +285,7 @@ export default class SshHosts extends View {
       .border_1().border_color(sel ? t.accent : t.border).bg(sel ? t.raised : t.surface)
       .hover((s) => s.bg(t.raised))
       .on_mouse_down("left", (e, cx) => {
-        if (e.click_count === 2) this.connect(h, "tab");
+        if (e.click_count === 2) this.connect(h, "tab", cx);
         else { this.selected = i; cx.notify(); }
       })
       .child(div().w(40).h(40).rounded(9).flex().items_center().justify_center().flex_none().bg(t.accent + "26").text_color(t.accent).child(svg(ICON("server")).size(20)))
@@ -308,8 +293,8 @@ export default class SshHosts extends View {
         .child(div().text_size(13.5).font_semibold().text_color(t.foreground).truncate().child(h.label))
         .child(div().text_size(11.5).text_color(t.dim).truncate().child(sel ? target(h) : subtitle(h))))
       .when(sel, (el) => el
-        .child(this.iconButton(t, `go-${i}`, "terminal", () => this.connect(h, "tab")))
-        .child(this.iconButton(t, `split-${i}`, "split", () => this.connect(h, "split")))
+        .child(this.iconButton(t, `go-${i}`, "terminal", (cx) => this.connect(h, "tab", cx)))
+        .child(this.iconButton(t, `split-${i}`, "split", (cx) => this.connect(h, "split", cx)))
         .child(this.iconButton(t, `edit-${i}`, "pencil", (cx) => this.edit(i, cx)))
         .child(this.iconButton(t, `del-${i}`, "trash", (cx) => this.remove(i, cx), true)));
   }
@@ -368,7 +353,7 @@ export default class SshHosts extends View {
         .child(this.button(t, "ssh-do-export", "Export", false, (_e, cx) => this.exportFile(this.pathInput.value(), cx))))
       .when(Boolean(this.note), (el) => el.child(div().pt(14).text_size(12).line_height("17px").text_color(this.noteError ? t.blocked : t.working).child(this.note)))
       .child(div().flex_1())
-      .child(div().text_size(11.5).line_height("16px").text_color(t.dim).child("Import skips hosts already saved (same name, address, user and port). Passwords in a LiteTerm file are kept and exported back as plain text; they are not used to connect."));
+      .child(div().text_size(11.5).line_height("16px").text_color(t.dim).child("Import skips hosts already saved (same name, address, user and port). Saved passwords are stored and exported as plain text, and typed for you when ssh asks."));
   }
 
   render() {
