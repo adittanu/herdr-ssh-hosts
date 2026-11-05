@@ -6,7 +6,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { run, hc, terminals, focused, shared, setShared, theme, appHome, home, readTextFile, writeTextFile, notify } from "herdr";
+import { run, hc, exec, window, terminals, focused, shared, setShared, theme, appHome, home, readTextFile, writeTextFile, notify } from "herdr";
 import { fromLiteTerm, mergeHosts, toLiteTerm } from "./liteterm.js";
 
 const ICON = (n) => `mods/ssh-hosts/${n}.svg`;
@@ -54,6 +54,46 @@ function sshArgv(h) {
 const target = (h) => (h.alias && !h.host ? h.alias : `${h.user ? h.user + "@" : ""}${h.host}${h.port && h.port !== "22" ? ":" + h.port : ""}`);
 const subtitle = (h) => ["ssh", h.user || (h.alias ? h.alias : ""), h.password ? "auto-login" : ""].filter(Boolean).join(", ");
 
+const IPV4 = /^(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+
+// A typed or pasted name: example.com, or https://example.com:443/path.
+function domainOf(raw) {
+  let s = String(raw ?? "").trim().toLowerCase();
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
+  s = s.split(/[/?#]/)[0].replace(/:\d+$/, "").replace(/\.$/, "");
+  if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/.test(s)) return null;
+  if (IPV4.test(s)) return null;
+  return s;
+}
+
+function parseAddresses(text) {
+  const ips = new Set();
+  const v4 = /\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b/g;
+  const v6 = /\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}\b/gi;
+  const body = String(text ?? "");
+  for (const m of body.matchAll(v4)) ips.add(m[0]);
+  for (const m of body.matchAll(v6)) ips.add(m[0].toLowerCase());
+  return [...ips];
+}
+
+// One address per line. Windows uses the system resolver; elsewhere, nslookup after the "Name:" line
+// so the resolver's own address is not treated as the answer.
+async function resolveName(name) {
+  try {
+    if (window().platform === "windows") {
+      const script = `foreach ($t in 'A','AAAA') { Resolve-DnsName -Name '${name}' -Type $t -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress } }`;
+      const r = await exec("powershell", ["-NoProfile", "-NonInteractive", "-Command", script]);
+      return parseAddresses(r.stdout);
+    }
+    const r = await exec("nslookup", [name]);
+    const text = `${r.stdout}\n${r.stderr}`;
+    const at = text.search(/^Name:/im);
+    return at < 0 ? [] : parseAddresses(text.slice(at).replace(/^Name:.*$/im, ""));
+  } catch {
+    return null;
+  }
+}
+
 export default class SshHosts extends View {
   init(_props, cx) {
     this.hosts = [];
@@ -79,8 +119,14 @@ export default class SshHosts extends View {
     this.error = "";
     this.handle = cx.focus_handle();
 
-    this.search = InputState.new({ placeholder: "Find a host" });
-    this.search.on("change", (_e, cx) => { this.query = this.search.value(); cx.notify(); });
+    this.dns = new Map(); // hostname -> addresses, or null while that lookup is failing
+    this.dnsPending = new Map();
+    this.lookup = null; // { name, status: wait|loading|done|error, ips }
+    this.lookupGen = 0;
+    this.lookupWait = 0;
+
+    this.search = InputState.new({ placeholder: "Find a host or domain" });
+    this.search.on("change", (_e, cx) => { this.query = this.search.value(); this.scheduleLookup(cx); cx.notify(); });
     this.search.on("focus", (_e, cx) => { this.focusedField = "search"; cx.notify(); });
     this.search.on("blur", (_e, cx) => { if (this.focusedField === "search") this.focusedField = null; cx.notify(); });
     this.search.on("submit", (_e, cx) => {
@@ -131,10 +177,78 @@ export default class SshHosts extends View {
 
   filtered() {
     const q = this.query.trim().toLowerCase();
+    const name = domainOf(this.query);
+    const found = name && this.lookup?.name === name && this.lookup.status === "done" ? new Set(this.lookup.ips) : null;
     return this.hosts
       .map((h, i) => ({ h, i }))
-      .filter(({ h }) => this.group === null || (h.group || "Ungrouped") === this.group)
-      .filter(({ h }) => !q || [h.label, h.host, h.user, h.group, h.alias].some((v) => (v ?? "").toLowerCase().includes(q)));
+      .filter(({ h }) => {
+        const inGroup = this.group === null || (h.group || "Ungrouped") === this.group;
+        const text = !q || [h.label, h.host, h.user, h.group, h.alias].some((v) => (v ?? "").toLowerCase().includes(q));
+        if (found && this.sharesAddress(h, found)) return true;
+        return inGroup && text;
+      })
+      .map((row) => {
+        const addr = (row.h.host || "").trim().toLowerCase();
+        const byIp = Boolean(found && this.sharesAddress(row.h, found) && addr !== name);
+        let via = null;
+        if (byIp) {
+          via = `${name} is on this server`;
+          const group = row.h.group || "Ungrouped";
+          if (this.group !== null && group !== this.group) via += ` (${group})`;
+        }
+        return { ...row, via };
+      });
+  }
+
+  sharesAddress(h, ips) {
+    const addr = (h.host || "").trim().toLowerCase();
+    if (!addr) return false;
+    if (ips.has(addr)) return true;
+    const known = this.dns.get(addr);
+    return Array.isArray(known) && known.some((ip) => ips.has(ip));
+  }
+
+  // Wait until typing pauses, then resolve the domain and any saved hostnames.
+  scheduleLookup(cx) {
+    const name = domainOf(this.query);
+    this.lookupWait += 1;
+    const wait = this.lookupWait;
+    if (!name) { this.lookup = null; this.lookupGen += 1; return; }
+    this.lookup = { name, status: "wait", ips: this.dns.get(name) ?? [] };
+    cx.timer.after(350, (cx) => {
+      if (wait !== this.lookupWait) return;
+      this.resolveQuery(name, cx);
+    });
+  }
+
+  addresses(name) {
+    if (this.dns.has(name)) return Promise.resolve(this.dns.get(name));
+    if (this.dnsPending.has(name)) return this.dnsPending.get(name);
+    const pending = resolveName(name).then((ips) => {
+      this.dnsPending.delete(name);
+      if (ips) this.dns.set(name, ips);
+      return ips;
+    });
+    this.dnsPending.set(name, pending);
+    return pending;
+  }
+
+  resolveQuery(name, cx) {
+    const gen = ++this.lookupGen;
+    this.lookup = { name, status: "loading", ips: this.dns.get(name) ?? [] };
+    cx.notify();
+    cx.spawn(async (cx) => {
+      const ips = await this.addresses(name);
+      const names = [...new Set(this.hosts.map((h) => (h.host || "").trim().toLowerCase())
+        .filter((n) => n && n !== name && !IPV4.test(n) && !n.includes(":")))];
+      for (let i = 0; i < names.length; i += 4) {
+        await Promise.all(names.slice(i, i + 4).map((n) => this.addresses(n)));
+        if (gen !== this.lookupGen) return;
+      }
+      if (gen !== this.lookupGen) return;
+      this.lookup = { name, status: ips ? "done" : "error", ips: ips ?? [] };
+      cx.notify();
+    });
   }
 
   connect(h, place, cx) {
@@ -183,18 +297,24 @@ export default class SshHosts extends View {
     }
     this.pending = this.pending.filter((p) => !p.dead);
   }
-  edit(index, cx) {
+  edit(index, cx, preset) {
     this.transfer = false;
     this.form = true;
     this.editing = index;
     this.error = "";
-    const h = index === null ? { group: this.group ?? "" } : this.hosts[index];
+    const h = preset ?? (index === null ? { group: this.group ?? "" } : this.hosts[index]);
     for (const [key] of FIELDS) {
       this.values[key] = h[key] ?? "";
       this.inputs[key].set_value(h[key] ?? "");
     }
     cx.notify();
-    cx.timer.after(80, () => this.inputs.label.focus());
+    cx.timer.after(80, () => this.inputs[preset ? "user" : "label"].focus());
+  }
+
+  // The domain is not saved. Open the form with its name and address filled in.
+  addResolved(ip, cx) {
+    const name = domainOf(this.query) ?? "";
+    this.edit(null, cx, { label: name, host: ip, port: "22", group: this.group ?? "" });
   }
 
   save(cx) {
@@ -255,28 +375,34 @@ export default class SshHosts extends View {
   }
 
   button(t, id, text, primary, action, icon) {
-    return h_flex().id(id).h(32).px(14).gap(6).items_center().flex_none().rounded(8)
+    return h_flex().id(id).h(32).px(14).gap(6).items_center().min_w(0).rounded(8)
       .border_1().border_color(primary ? t.accent : t.input).bg(primary ? t.accent : t.raised)
       .text_color(primary ? t.accent_foreground : t.foreground).text_size(12.5).font_semibold().cursor_pointer()
-      .hover((s) => s.opacity(0.88)).on_click(action)
-      .when(Boolean(icon), (el) => el.child(svg(ICON(icon)).size(13)))
-      .child(text);
+      .hover((s) => s.bg(primary ? t.accent : t.hover))
+      .active((s) => s.opacity(0.86)).on_click(action)
+      .when(Boolean(icon), (el) => el.child(svg(ICON(icon)).size(13).flex_none()))
+      .child(div().min_w(0).truncate().child(text));
   }
 
-  iconButton(t, id, icon, action, danger) {
-    return div().id(id).w(26).h(26).rounded(6).flex().items_center().justify_center().flex_none().cursor_pointer()
-      .text_color(danger ? t.blocked : t.muted).hover((s) => s.bg(t.hover))
+  iconButton(t, id, icon, action, danger, label) {
+    return div().id(id).w(30).h(30).rounded(8).flex().items_center().justify_center().flex_none().cursor_pointer()
+      .text_color(danger ? t.blocked : t.foreground)
+      .tooltip(label).accessibility_label(label)
+      .hover((s) => s.bg(danger ? t.blocked + "24" : t.raised))
+      .active((s) => s.opacity(0.72))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => { cx.stop_propagation(); action(cx); })
-      .child(svg(ICON(icon)).size(14));
+      .child(svg(ICON(icon)).size(15));
   }
 
   navItem(t, id, label, count, active, action) {
-    return h_flex().id(id).h(30).px(10).gap(8).items_center().flex_none().rounded(7).cursor_pointer()
-      .bg(active ? t.selected : t.chrome).text_color(active ? t.foreground : t.muted).text_size(12.5)
-      .hover((s) => s.bg(t.hover)).on_click(action)
+    return h_flex().id(id).h(32).px(10).gap(8).items_center().flex_none().rounded(8).cursor_pointer()
+      .bg(active ? t.selected : t.chrome).text_color(active ? t.foreground : t.muted).text_size(13)
+      .when(active, (el) => el.font_medium())
+      .when(!active, (el) => el.hover((s) => s.bg(t.hover)))
+      .active((s) => s.opacity(0.86)).on_click(action)
       .child(div().flex_1().min_w(0).truncate().child(label))
-      .child(div().text_size(11).text_color(t.dim).child(String(count)));
+      .child(div().text_size(11).text_color(active ? t.muted : t.dim).child(String(count)));
   }
 
   sidebar(t) {
@@ -290,39 +416,84 @@ export default class SshHosts extends View {
       .children(this.groups().map(([g, n]) => this.navItem(t, `nav-${g}`, g, n, this.group === g, (_e, cx) => { this.group = g; cx.notify(); })))
       .child(div().flex_1())
       .child(v_flex().gap(8)
-        .child(this.button(t, "ssh-transfer", "Import / Export", false, (_e, cx) => this.openTransfer(cx), "swap"))
-        .child(this.button(t, "ssh-import", "Import ~/.ssh/config", false, (_e, cx) => this.importConfig(cx))));
+        .child(this.button(t, "ssh-transfer", "Import / Export", false, (_e, cx) => this.openTransfer(cx), "swap").w_full())
+        .child(this.button(t, "ssh-import", "Import ~/.ssh/config", false, (_e, cx) => this.importConfig(cx)).w_full()));
   }
 
-  card(t, { h, i }) {
+  card(t, { h, i, via }) {
     const sel = this.selected === i;
     const hide = this.privacy();
-    return h_flex().id(`card-${i}`).w(268).h(66).px(12).gap(12).items_center().flex_none().rounded(10).cursor_pointer()
-      .border_1().border_color(sel ? t.accent : t.border).bg(sel ? t.raised : t.surface)
-      .hover((s) => s.bg(t.raised))
+    const detail = sel ? target(h) : subtitle(h);
+    // Actions sit on their own row. Sharing the title row squeezed the label
+    // down to a few characters and painted the buttons on top of it.
+    return v_flex().id(`card-${i}`).w(268).flex_none().rounded(12).cursor_pointer().overflow_hidden()
+      .border_1().border_color(sel ? t.accent : t.border).bg(sel ? t.selected : t.surface)
+      .when(!sel, (el) => el.hover((s) => s.bg(t.hover)))
       .on_mouse_down("left", (e, cx) => {
         if (e.click_count === 2) this.connect(h, "tab", cx);
         else { this.selected = i; cx.notify(); }
       })
-      .child(div().w(40).h(40).rounded(9).flex().items_center().justify_center().flex_none().bg(t.accent + "26").text_color(t.accent).child(svg(ICON("server")).size(20)))
-      .child(v_flex().flex_1().min_w(0).gap(1)
-        .child(hide ? this.redact(t, h.label, 13.5, 17) : div().text_size(13.5).font_semibold().text_color(t.foreground).truncate().child(h.label))
-        .child(hide ? this.redact(t, sel ? target(h) : subtitle(h), 11.5, 15) : div().text_size(11.5).text_color(t.dim).truncate().child(sel ? target(h) : subtitle(h))))
-      .when(sel, (el) => el
-        .child(this.iconButton(t, `go-${i}`, "terminal", (cx) => this.connect(h, "tab", cx)))
-        .child(this.iconButton(t, `split-${i}`, "split", (cx) => this.connect(h, "split", cx)))
-        .child(this.iconButton(t, `edit-${i}`, "pencil", (cx) => this.edit(i, cx)))
-        .child(this.iconButton(t, `del-${i}`, "trash", (cx) => this.remove(i, cx), true)));
+      .child(h_flex().px(12).py(12).gap(12).items_center()
+        .child(div().w(40).h(40).rounded(10).flex().items_center().justify_center().flex_none()
+          .bg(t.accent + (sel ? "33" : "22")).text_color(t.accent).child(svg(ICON("server")).size(20)))
+        .child(v_flex().flex_1().min_w(0).gap(3)
+          .child(hide ? this.redact(t, h.label, 14, 18) : div().text_size(14).font_semibold().text_color(t.foreground).truncate().child(h.label))
+          .child(hide ? this.redact(t, detail, 12, 16) : div().text_size(12).text_color(sel ? t.muted : t.dim).truncate().child(detail))
+          .when(Boolean(via), (el) => el.child(
+            hide
+              ? div().text_size(12).text_color(t.accent).truncate().child("On this server")
+              : div().text_size(12).text_color(t.accent).truncate().child(via)))))
+      .when(sel, (el) => el.child(
+        h_flex().px(8).py(6).gap(4).items_center().border_t(1).border_color(t.border).bg(t.surface)
+          .child(h_flex().id(`go-${i}`).h(30).px(10).gap(6).items_center().flex_none().rounded(8).cursor_pointer()
+            .bg(t.accent).text_color(t.accent_foreground).text_size(12).font_semibold()
+            .accessibility_label("Connect").tooltip("Connect")
+            .active((s) => s.opacity(0.86))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => { cx.stop_propagation(); this.connect(h, "tab", cx); })
+            .child(svg(ICON("terminal")).size(14)).child("Connect"))
+          .child(div().flex_1())
+          .child(this.iconButton(t, `split-${i}`, "split", (cx) => this.connect(h, "split", cx), false, "Split"))
+          .child(this.iconButton(t, `edit-${i}`, "pencil", (cx) => this.edit(i, cx), false, "Edit"))
+          .child(this.iconButton(t, `del-${i}`, "trash", (cx) => this.remove(i, cx), true, "Remove"))));
+  }
+
+  offerCard(t, name, ip, n) {
+    return v_flex().id(`offer-${n}`).w(268).flex_none().rounded(12).overflow_hidden()
+      .border_1().border_color(t.border).bg(t.surface)
+      .child(h_flex().px(12).py(12).gap(12).items_center()
+        .child(div().w(40).h(40).rounded(10).flex().items_center().justify_center().flex_none()
+          .bg(t.accent + "22").text_color(t.accent).child(svg(ICON("server")).size(20)))
+        .child(v_flex().flex_1().min_w(0).gap(3)
+          .child(div().text_size(14).font_semibold().text_color(t.foreground).truncate().child(name))
+          .child(div().text_size(12).text_color(t.muted).truncate().child(ip))
+          .child(div().text_size(12).text_color(t.accent).truncate().child("Not in your hosts"))))
+      .child(h_flex().px(8).py(6).border_t(1).border_color(t.border).bg(t.surface)
+        .child(this.button(t, `offer-add-${n}`, "Add host", true, (_e, cx) => this.addResolved(ip, cx), "plus")));
   }
 
   main(t) {
     const rows = this.filtered();
+    const name = domainOf(this.query);
+    const lookup = name && this.lookup?.name === name ? this.lookup : null;
+    const looking = lookup && (lookup.status === "wait" || lookup.status === "loading");
+    let emptyTitle = this.hosts.length ? "No host matches" : "Add your first host";
+    let emptyBody = this.hosts.length ? "Try another search or group." : "Press NEW HOST, or import your ~/.ssh/config.";
+    if (looking) { emptyTitle = `Looking up ${name}...`; emptyBody = "Checking it against your saved hosts."; }
+    else if (lookup?.status === "error") { emptyTitle = `Couldn't look up ${name}`; emptyBody = "Check the name, or search by the address you saved."; }
+    else if (lookup?.status === "done" && !lookup.ips.length) { emptyTitle = `No address for ${name}`; emptyBody = "That name did not resolve."; }
+    const offers = lookup?.status === "done" && !rows.length ? lookup.ips : [];
     const grid = rows.length
-      ? h_flex().flex_wrap().gap(12).content_start().children(rows.map((r) => this.card(t, r)))
-      : v_flex().pt(80).items_center().gap(8)
-          .child(div().w(56).h(56).rounded(14).flex().items_center().justify_center().bg(t.raised).text_color(t.dim).child(svg(ICON("server")).size(26)))
-          .child(div().text_size(14).font_medium().child(this.hosts.length ? "No host matches" : "Add your first host"))
-          .child(div().text_size(12).text_color(t.dim).child(this.hosts.length ? "Try another search or group." : "Press NEW HOST, or import your ~/.ssh/config."));
+      ? h_flex().flex_wrap().gap(12).content_start().items_start().children(rows.map((r) => this.card(t, r)))
+      : offers.length
+        ? v_flex().gap(12)
+            .child(div().text_size(14).font_medium().child(`${name} is not in your hosts`))
+            .child(div().text_size(12).text_color(t.dim).child("Add the address, then enter a username and a password or a key."))
+            .child(h_flex().flex_wrap().gap(12).items_start().children(offers.map((ip, n) => this.offerCard(t, name, ip, n))))
+        : v_flex().pt(80).items_center().gap(8)
+            .child(div().w(56).h(56).rounded(14).flex().items_center().justify_center().bg(t.raised).text_color(t.dim).child(svg(ICON("server")).size(26)))
+            .child(div().text_size(14).font_medium().child(emptyTitle))
+            .child(div().px(24).text_size(12).text_color(t.dim).child(emptyBody));
     return v_flex().flex_1().min_w(0).h_full()
       .child(h_flex().h(60).px(20).gap(12).items_center().flex_none().border_b(1).border_color(t.border)
         .child(div().flex_1().max_w(520).child(
@@ -339,6 +510,7 @@ export default class SshHosts extends View {
         .child(h_flex().items_baseline().gap(8)
           .child(div().text_size(18).font_semibold().child(this.group ?? "Hosts"))
           .child(div().text_size(12).text_color(t.dim).child(`${rows.length} host${rows.length === 1 ? "" : "s"}`)))
+        .when(looking && rows.length > 0, (el) => el.child(div().text_size(12.5).text_color(t.muted).child(`Looking up ${name}...`)))
         .child(!this.loaded ? div().text_size(12.5).text_color(t.dim).child("Loading...") : grid)
         .when(Boolean(this.error) && !this.form, (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.error))));
   }
@@ -347,7 +519,7 @@ export default class SshHosts extends View {
     return v_flex().w(320).flex_none().h_full().p(18).bg(t.chrome).border_l(1).border_color(t.border)
       .child(h_flex().items_center().pb(6)
         .child(div().flex_1().text_size(15).font_semibold().child(this.editing === null ? "New host" : "Edit host"))
-        .child(this.iconButton(t, "form-close", "x", (cx) => { this.form = false; this.error = ""; cx.notify(); })))
+        .child(this.iconButton(t, "form-close", "x", (cx) => { this.form = false; this.error = ""; cx.notify(); }, false, "Close")))
       .child(v_flex().id("form-scroll").flex_1().min_h(0).overflow_y_scroll()
         .children(FIELDS.map(([key, label]) => v_flex()
           .child(div().pt(10).pb(5).text_size(11.5).text_color(t.dim).child(label))
@@ -364,7 +536,7 @@ export default class SshHosts extends View {
     return v_flex().w(340).flex_none().h_full().p(18).bg(t.chrome).border_l(1).border_color(t.border)
       .child(h_flex().items_center().pb(6)
         .child(div().flex_1().text_size(15).font_semibold().child("Import / Export"))
-        .child(this.iconButton(t, "transfer-close", "x", close)))
+        .child(this.iconButton(t, "transfer-close", "x", close, false, "Close")))
       .child(div().pt(4).text_size(12).line_height("17px").text_color(t.muted).child("A LiteTerm hosts file (.json). You can also drop one onto this tab to import it."))
       .child(div().pt(14).pb(5).text_size(11.5).text_color(t.dim).child("File path"))
       .child(Input.new(this.pathInput).h(34).px(10).rounded(8).border_1()
